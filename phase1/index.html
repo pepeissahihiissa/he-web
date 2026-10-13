@@ -37,7 +37,8 @@
 <table id="tbl-reach"><tr><th>項目</th><th>結果</th><th>使用EP</th></tr></table>
 
 <h2>2. Happy Eyeballs テスト（合計時間比較）</h2>
-<p class="note">初回＝別ホスト5種で毎回新規接続（DNS＋TCP＋TLS）。2回目以降＝同一URL再利用。再利用で差が消えればHE/再利用の特徴と一致します。</p>
+<p class="note">初回＝別ホスト6種で毎回新規接続（DNS＋TCP＋TLS）。2回目以降＝同一URL再利用。再利用で差が消えればHE/再利用の特徴と一致します。<br>
+一部ホストのみ失敗する場合、広告ブロック拡張機能の干渉が既知事例です（例：www.google.com/generate_204 は主要フィルタに既定ブロック対象＝ERR_BLOCKED_BY_CLIENT）。失敗は中央値計算から除外されるため、残りホストの結果は有効です。気になる場合は拡張機能を一時停止して再測定してください。</p>
 <table id="tbl-he"><tr><th>#</th><th>種別</th><th>URL</th><th>結果ms</th></tr></table>
 <div id="he-stats"></div>
 
@@ -83,11 +84,13 @@ const EP = {
     "https://ipv6.seeip.org/",
   ],
   coldDual: [ // 初回用・別ホスト（CORS不要、no-corsで合計時間のみ計測）
-    "https://www.google.com/generate_204",
+    // 注: www.google.com/generate_204 は主要広告ブロックに既定ブロックされるため除外
     "https://www.gstatic.com/generate_204",
     "https://www.cloudflare.com/cdn-cgi/trace",
     "https://captive.apple.com/",
     "https://detectportal.firefox.com/success.txt",
+    "https://www.apple.com/",
+    "https://www.microsoft.com/",
   ],
 };
 function parseIp(text, url){
@@ -169,19 +172,28 @@ async function run(){
   // ---- 2. HE：初回vs再利用 ----
   prog("2/5 HE初回測定中…");
   const cold=[], t2=$("tbl-he"); let i=0;
+  const esc = s => String(s).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");
   for(const u of EP.coldDual){
     const r = await fetchTimeOnly(u, TO);
     cold.push(r);
-    row(t2,[++i,"初回",u.replace("https://",""), r.ok?f1(r.ms):"<span class='ng'>失敗</span>"]);
+    row(t2,[++i,"初回",u.replace("https://",""), r.ok?f1(r.ms):"<span class='ng' title='"+esc(r.error||"")+"'>失敗</span>"]);
+    if(!r.ok) diag("初回失敗: "+u+" → "+(r.error||""));
     prog(`2/5 HE初回測定中…(${i}/${EP.coldDual.length})`);
   }
   prog("3/5 再利用測定中…");
   const warm=[];
-  const warmUrl = EP.coldDual[0];
-  for(let k=0;k<3;k++){
-    const r = await fetchTimeOnly(warmUrl, TO);
-    warm.push(r);
-    row(t2,["","再利用",warmUrl.replace("https://","")+"（"+(k+1)+"回目）", r.ok?f1(r.ms):"<span class='ng'>失敗</span>"]);
+  const warmSrc = cold.find(r=>r.ok);
+  const warmUrl = warmSrc ? warmSrc.url : null;
+  if(!warmUrl){
+    row(t2,["","再利用","(初回が全滅のためスキップ)","<span class='ng'>-</span>"]);
+    diag("再利用スキップ: 初回成功が0件");
+  } else {
+    for(let k=0;k<3;k++){
+      const r = await fetchTimeOnly(warmUrl, TO);
+      warm.push(r);
+      row(t2,["","再利用",warmUrl.replace("https://","")+"（"+(k+1)+"回目）", r.ok?f1(r.ms):"<span class='ng' title='"+esc(r.error||"")+"'>失敗</span>"]);
+      if(!r.ok) diag("再利用失敗: "+warmUrl+" → "+(r.error||""));
+    }
   }
   const coldMs = cold.filter(r=>r.ok).map(r=>r.ms), warmMs = warm.filter(r=>r.ok).map(r=>r.ms);
   const cs = stats(coldMs), ws = stats(warmMs);
@@ -195,13 +207,13 @@ async function run(){
   const v6latUrl = v6.ok ? v6.ep : EP.egressV6[0];
   for(let k=0;k<N;k++){
     const r = await fetchTimeOnly(v4latUrl, TO);
-    if(r.ok) lat4.push(r.ms);
-    row(t3,[++j,"v4", r.ok?f1(r.ms):"<span class='ng'>失敗</span>"]);
+    if(r.ok) lat4.push(r.ms); else diag("v4遅延失敗: "+v4latUrl+" → "+(r.error||""));
+    row(t3,[++j,"v4", r.ok?f1(r.ms):"<span class='ng' title='"+esc(r.error||"")+"'>失敗</span>"]);
   }
   for(let k=0;k<N;k++){
     const r = await fetchTimeOnly(v6latUrl, TO);
-    if(r.ok) lat6.push(r.ms);
-    row(t3,[++j,"v6", r.ok?f1(r.ms):"<span class='ng'>失敗</span>"]);
+    if(r.ok) lat6.push(r.ms); else diag("v6遅延失敗: "+v6latUrl+" → "+(r.error||""));
+    row(t3,[++j,"v6", r.ok?f1(r.ms):"<span class='ng' title='"+esc(r.error||"")+"'>失敗</span>"]);
   }
   const s4=stats(lat4), s6=stats(lat6);
   $("lat-stats").innerHTML =
