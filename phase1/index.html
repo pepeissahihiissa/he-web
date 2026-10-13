@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HE簡易判定 Phase 1（Happy Eyeballs / IPv4・IPv6）</title>
+<style>
+  body{font-family:system-ui,"Hiragino Sans","Noto Sans JP",sans-serif;max-width:960px;margin:0 auto;padding:16px;line-height:1.6;color:#222}
+  h1{font-size:1.4em} h2{font-size:1.15em;margin-top:2em;border-bottom:2px solid #eee;padding-bottom:4px}
+  button{font-size:1em;padding:8px 20px;cursor:pointer}
+  table{border-collapse:collapse;width:100%;margin:8px 0;font-size:.9em}
+  th,td{border:1px solid #ccc;padding:4px 8px;text-align:left}
+  th{background:#f5f5f5}
+  .ok{color:#0a0}.ng{color:#c00}.warn{color:#b80}
+  #verdict{background:#f7f7ff;border:1px solid #ccd;padding:12px;margin:12px 0;white-space:pre-wrap}
+  #report{width:100%;height:180px;font-family:monospace;font-size:.85em}
+  details{margin:8px 0} summary{cursor:pointer;font-weight:bold}
+  .note{font-size:.85em;color:#555}
+  #progress{margin:8px 0;font-weight:bold}
+</style>
+</head>
+<body>
+<h1>Happy Eyeballs 簡易判定（Phase 1 試作）</h1>
+<p class="note">測定はすべてブラウザ内で完結します。IPアドレスは画面表示のみで、測定先CDNへの通常アクセス以外の外部送信はありません。<br>
+回線種別（PPPoE/IPoE）の<b>確定判定はブラウザからは不可能</b>なため、材料表示＋推定に留めています。スループットのファミリ別比較・TCP相内訳は Phase 2（自前エンドポイントが必要）の範囲です。</p>
+
+<div>
+  <label>試行回数（遅延測定）:
+    <select id="trials"><option>3</option><option selected>5</option><option>7</option></select>
+  </label>
+  <label>タイムアウト秒: <select id="timeout"><option>6</option><option selected>10</option><option>15</option></select></label>
+  <button id="run">測定開始</button>
+  <span id="progress"></span>
+</div>
+
+<h2>1. 到達性・外部アドレス</h2>
+<table id="tbl-reach"><tr><th>項目</th><th>結果</th><th>使用EP</th></tr></table>
+
+<h2>2. Happy Eyeballs テスト（合計時間比較）</h2>
+<p class="note">初回＝別ホスト5種で毎回新規接続（DNS＋TCP＋TLS）。2回目以降＝同一URL再利用。再利用で差が消えればHE/再利用の特徴と一致します。</p>
+<table id="tbl-he"><tr><th>#</th><th>種別</th><th>URL</th><th>結果ms</th></tr></table>
+<div id="he-stats"></div>
+
+<h2>3. v4 / v6 レイテンシ比較（小取得×N）</h2>
+<table id="tbl-lat"><tr><th>#</th><th>経路</th><th>結果ms</th></tr></table>
+<div id="lat-stats"></div>
+
+<h2>4. 回線推定の材料（逆引き等）</h2>
+<table id="tbl-rdns"><tr><th>項目</th><th>結果</th></tr></table>
+
+<h2>5. 判定（推定）</h2>
+<div id="verdict">未測定</div>
+
+<h2>6. 共有用レポート</h2>
+<textarea id="report" readonly></textarea><br>
+<button id="copy">レポートをコピー</button> <span id="copied"></span>
+
+<h2>7. 診断ログ（失敗内訳・拡張機能ブロック疑い）</h2>
+<details><summary>開く</summary><div id="diag"></div></details>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const diagLogs = [];
+function diag(msg){ diagLogs.push(msg); $("diag").innerHTML = diagLogs.map(x=>"<div>"+x+"</div>").join(""); }
+
+// ---- 候補エンドポイント（先頭から順に試し、最初に成功したものを使う） ----
+const EP = {
+  egressDual: [ // 二重スタック＋CORS可。ブラウザのHE勝者ファミリがそのまま出る
+    "https://api64.ipify.org?format=json",
+    "https://www.cloudflare.com/cdn-cgi/trace",
+    "https://wtfismyip.com/json",
+  ],
+  egressV4: [ // Aのみ
+    "https://ipv4.icanhazip.com/",
+    "https://v4.ident.me/",
+    "https://ipinfo.io/json",
+  ],
+  egressV6: [ // AAAAのみ
+    "https://ipv6.icanhazip.com/",
+    "https://v6.ident.me/",
+    "https://ipv6.seeip.org/",
+  ],
+  coldDual: [ // 初回用・別ホスト（CORS不要、no-corsで合計時間のみ計測）
+    "https://www.google.com/generate_204",
+    "https://www.gstatic.com/generate_204",
+    "https://www.cloudflare.com/cdn-cgi/trace",
+    "https://captive.apple.com/",
+    "https://detectportal.firefox.com/success.txt",
+  ],
+};
+function parseIp(text, url){
+  if(!text) return "";
+  try{ const j = JSON.parse(text); if(j.ip) return j.ip; }catch(e){}
+  let m = text.match(/YourFuckingIPAddress["']?\s*:\s*["']?([0-9a-fA-F.:]+)/);
+  if(m) return m[1];
+  m = text.match(/^ip=([0-9a-fA-F.:]+)/m);
+  if(m) return m[1];
+  m = text.trim().match(/^([0-9a-fA-F.:]+)$/);
+  if(m) return m[1];
+  return "";
+}
+const isV6 = ip => ip.includes(":");
+async function fetchText(url, timeoutMs){
+  const ctl = new AbortController();
+  const t = setTimeout(()=>ctl.abort(), timeoutMs);
+  const t0 = performance.now();
+  try{
+    const r = await fetch(url + (url.includes("?")?"&":"?") + "_=" + Date.now() + Math.random().toString(16).slice(2),
+      {mode:"cors", cache:"no-store", signal:ctl.signal});
+    const text = await r.text();
+    return {ok:true, ms:performance.now()-t0, status:r.status, text, url};
+  }catch(e){ return {ok:false, ms:performance.now()-t0, error:String(e).slice(0,120), url}; }
+  finally{ clearTimeout(t); }
+}
+async function fetchTimeOnly(url, timeoutMs){ // no-cors：ヘッダ受信まで（DNS+TCP+TLS+TTFB相当）
+  const ctl = new AbortController();
+  const t = setTimeout(()=>ctl.abort(), timeoutMs);
+  const t0 = performance.now();
+  try{
+    await fetch(url + (url.includes("?")?"&":"?") + "_=" + Date.now() + Math.random().toString(16).slice(2),
+      {mode:"no-cors", cache:"no-store", signal:ctl.signal, redirect:"follow"});
+    return {ok:true, ms:performance.now()-t0, url};
+  }catch(e){ return {ok:false, ms:performance.now()-t0, error:String(e).slice(0,120), url}; }
+  finally{ clearTimeout(t); }
+}
+async function firstSuccess(list, timeoutMs, reader){
+  for(const u of list){
+    const r = await reader(u, timeoutMs);
+    if(r.ok) return {...r, ep:u};
+    diag("到達失敗: " + u + " → " + (r.error||r.status));
+  }
+  return {ok:false, ep:"(all failed)"};
+}
+function stats(arr){
+  if(!arr.length) return null;
+  const a=[...arr].sort((x,y)=>x-y);
+  const med=a.length%2?a[(a.length-1)/2]:(a[a.length/2-1]+a[a.length/2])/2;
+  return {n:a.length, med, avg:a.reduce((s,v)=>s+v,0)/a.length, min:a[0], max:a[a.length-1]};
+}
+const f1 = v => v==null||v==="" ? "-" : (Math.round(v*10)/10);
+function row(tbody, cells){ const tr=document.createElement("tr"); cells.forEach(c=>{const td=document.createElement("td");td.innerHTML=c;tr.appendChild(td);});tbody.appendChild(tr); }
+
+async function run(){
+  $("run").disabled = true;
+  ["tbl-reach","tbl-he","tbl-lat","tbl-rdns"].forEach(id=>{
+    const t=$(id); while(t.rows.length>1) t.deleteRow(1);
+  });
+  $("he-stats").textContent=""; $("lat-stats").textContent=""; $("verdict").textContent="測定中…"; $("report").value="";
+  diagLogs.length=0; $("diag").innerHTML="";
+  const N = parseInt($("trials").value,10), TO = parseInt($("timeout").value,10)*1000;
+  const prog = s => $("progress").textContent = s;
+
+  // ---- 1. 到達性 ----
+  prog("1/5 到達性確認中…");
+  const d = await firstSuccess(EP.egressDual, TO, fetchText);
+  const dualIp = d.ok ? parseIp(d.text, d.ep) : "";
+  const v4 = await firstSuccess(EP.egressV4, TO, fetchText);
+  const v4Ip = v4.ok ? parseIp(v4.text, v4.ep) : "";
+  const v6 = await firstSuccess(EP.egressV6, TO, fetchText);
+  const v6Ip = v6.ok ? parseIp(v6.text, v6.ep) : "";
+  const v6ok = v6.ok && !!v6Ip, v4ok = v4.ok && !!v4Ip;
+  const t1=$("tbl-reach");
+  row(t1,["既定経路の外部IP（ブラウザHE勝者）", d.ok?(dualIp+" <span class='"+(isV6(dualIp)?"ok'>v6":"warn'>v4")+"</span>"):"<span class='ng'>取得不可</span>", d.ep]);
+  row(t1,["v4外部IP（Aのみ経由）", v4ok?v4Ip+" <span class='ok'>到達可</span>":"<span class='ng'>到達不可</span>", v4.ep]);
+  row(t1,["v6外部IP（AAAAのみ経由）", v6ok?v6Ip+" <span class='ok'>到達可</span>":"<span class='ng'>到達不可</span>", v6.ep]);
+
+  // ---- 2. HE：初回vs再利用 ----
+  prog("2/5 HE初回測定中…");
+  const cold=[], t2=$("tbl-he"); let i=0;
+  for(const u of EP.coldDual){
+    const r = await fetchTimeOnly(u, TO);
+    cold.push(r);
+    row(t2,[++i,"初回",u.replace("https://",""), r.ok?f1(r.ms):"<span class='ng'>失敗</span>"]);
+    prog(`2/5 HE初回測定中…(${i}/${EP.coldDual.length})`);
+  }
+  prog("3/5 再利用測定中…");
+  const warm=[];
+  const warmUrl = EP.coldDual[0];
+  for(let k=0;k<3;k++){
+    const r = await fetchTimeOnly(warmUrl, TO);
+    warm.push(r);
+    row(t2,["","再利用",warmUrl.replace("https://","")+"（"+(k+1)+"回目）", r.ok?f1(r.ms):"<span class='ng'>失敗</span>"]);
+  }
+  const coldMs = cold.filter(r=>r.ok).map(r=>r.ms), warmMs = warm.filter(r=>r.ok).map(r=>r.ms);
+  const cs = stats(coldMs), ws = stats(warmMs);
+  $("he-stats").innerHTML = cs?`初回: n=${cs.n} 中央値=${f1(cs.med)}ms 平均=${f1(cs.avg)}ms (最小${f1(cs.min)}〜最大${f1(cs.max)})`+"<br>"+
+    (ws?`再利用: n=${ws.n} 中央値=${f1(ws.med)}ms`+"<br>"+`差（初回−再利用）: <b>${f1(cs.med-ws.med)}ms</b>`:"再利用: 取得不可"):"初回: 取得不可";
+
+  // ---- 3. v4/v6レイテンシ ----
+  prog("4/5 レイテンシ測定中…");
+  const lat4=[], lat6=[], t3=$("tbl-lat"); let j=0;
+  const v4latUrl = v4.ok ? v4.ep : EP.egressV4[0];
+  const v6latUrl = v6.ok ? v6.ep : EP.egressV6[0];
+  for(let k=0;k<N;k++){
+    const r = await fetchTimeOnly(v4latUrl, TO);
+    if(r.ok) lat4.push(r.ms);
+    row(t3,[++j,"v4", r.ok?f1(r.ms):"<span class='ng'>失敗</span>"]);
+  }
+  for(let k=0;k<N;k++){
+    const r = await fetchTimeOnly(v6latUrl, TO);
+    if(r.ok) lat6.push(r.ms);
+    row(t3,[++j,"v6", r.ok?f1(r.ms):"<span class='ng'>失敗</span>"]);
+  }
+  const s4=stats(lat4), s6=stats(lat6);
+  $("lat-stats").innerHTML =
+    (s4?`v4: n=${s4.n} 中央値=${f1(s4.med)}ms (最小${f1(s4.min)}〜最大${f1(s4.max)})`:"v4: 取得不可")+"<br>"+
+    (s6?`v6: n=${s6.n} 中央値=${f1(s6.med)}ms (最小${f1(s6.min)}〜最大${f1(s6.max)})`:"v6: 取得不可");
+
+  // ---- 4. 逆引き（DoH） ----
+  prog("5/5 逆引き中…");
+  let ptr="-";
+  if(v4Ip && !isV6(v4Ip)){
+    const rev = v4Ip.split(".").reverse().join(".")+".in-addr.arpa";
+    const q = await fetchText("https://dns.google/resolve?name="+encodeURIComponent(rev)+"&type=PTR", TO);
+    try{
+      const ans=(JSON.parse(q.text).Answer||[]).map(a=>a.data).join(", ");
+      if(ans) ptr=ans;
+    }catch(e){ diag("DoH逆引き失敗: "+(q.error||"parse error")); }
+  }
+  const t4=$("tbl-rdns");
+  row(t4,["v4 egressの逆引き",ptr]);
+  row(t4,["UA",navigator.userAgent]);
+
+  // ---- 5. 判定 ----
+  const L=[];
+  L.push("【到達性】v4="+(v4ok?"可":"不可")+" / v6="+(v6ok?"可":"不可")+(dualIp?`（既定HE勝者: ${isV6(dualIp)?"v6":"v4"} ${dualIp}）`:""));
+  if(!v6ok) L.push("【v6】不通＝実質v4のみ環境の可能性。Chromium系では新規dual接続ごとに約250〜300msのフォールバック遅延が疑われます。");
+  else L.push("【v6】到達可。フォールバック遅延は基本なしの見込み。");
+  if(cs&&ws){
+    const diff=cs.med-ws.med;
+    if(diff>150) L.push(`【HE】初回が再利用より約${f1(diff)}ms遅い＝フォールバック遅延の特徴と一致（推定）。`);
+    else L.push(`【HE】初回−再利用差は約${f1(diff)}ms＝明確な遅延なし。`);
+  }
+  if(s4&&s6) L.push(`【遅延】v4中央値${f1(s4.med)}ms / v6中央値${f1(s6.med)}ms。`);
+  L.push("【回線】PPPoE/IPoEの断定は不可。v6="+(v6ok?"到達→IPoE系の可能性":"不通→PPPoE等v4のみの可能性")+"、逆引き="+ptr+" をISP心当たりと照合してください。");
+  const fails = diagLogs.length;
+  if(fails>0) L.push(`【注意】${fails}件のEP失敗あり。拡張機能（広告ブロック等）やDNSフィルタが測定用ホストを阻害している可能性があります。`);
+  $("verdict").textContent = L.join("\n");
+
+  // ---- 6. レポート ----
+  const rep=[
+    "[HE簡易判定 Phase1] "+new Date().toLocaleString("ja-JP"),
+    "UA: "+navigator.userAgent,
+    `到達: v4=${v4ok?v4Ip:"不可"} / v6=${v6ok?v6Ip:"不可"} / 既定=${dualIp||"不可"}`,
+    cs?`HE初回中央値=${f1(cs.med)}ms(n=${cs.n})`:"HE初回=不可",
+    ws?`HE再利用中央値=${f1(ws.med)}ms(n=${ws.n}) 差=${f1(cs.med-ws.med)}ms`:"HE再利用=不可",
+    s4?`v4遅延中央値=${f1(s4.med)}ms(n=${s4.n})`:"v4遅延=不可",
+    s6?`v6遅延中央値=${f1(s6.med)}ms(n=${s6.n})`:"v6遅延=不可",
+    "逆引き(v4)="+ptr,
+  ].join("\n");
+  $("report").value = rep;
+  prog("完了");
+  $("run").disabled = false;
+}
+$("run").addEventListener("click", ()=>run().catch(e=>{ $("verdict").textContent="エラー: "+e; $("run").disabled=false; }));
+$("copy").addEventListener("click", async ()=>{
+  try{ await navigator.clipboard.writeText($("report").value); $("copied").textContent="コピーしました"; }
+  catch(e){ $("report").select(); document.execCommand("copy"); $("copied").textContent="コピーしました"; }
+});
+</script>
+</body>
+</html>
