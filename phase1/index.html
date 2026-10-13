@@ -197,7 +197,12 @@ async function run(){
   }
   const coldMs = cold.filter(r=>r.ok).map(r=>r.ms), warmMs = warm.filter(r=>r.ok).map(r=>r.ms);
   const cs = stats(coldMs), ws = stats(warmMs);
-  $("he-stats").innerHTML = cs?`初回: n=${cs.n} 中央値=${f1(cs.med)}ms 平均=${f1(cs.avg)}ms (最小${f1(cs.min)}〜最大${f1(cs.max)})`+"<br>"+
+  let extra = "";
+  if(cs && cs.max > cs.med + 300){
+    const rest = coldMs.filter(v=>v<cs.max), rs = stats(rest);
+    extra = `<br>※最大値${f1(cs.max)}msは外れ値の可能性。除外時中央値=${rs?f1(rs.med):"-"}ms。単発では断定不可のため再測定推奨。`;
+  }
+  $("he-stats").innerHTML = cs?`初回: n=${cs.n} 中央値=${f1(cs.med)}ms 平均=${f1(cs.avg)}ms (最小${f1(cs.min)}〜最大${f1(cs.max)})`+extra+"<br>"+
     (ws?`再利用: n=${ws.n} 中央値=${f1(ws.med)}ms`+"<br>"+`差（初回−再利用）: <b>${f1(cs.med-ws.med)}ms</b>`:"再利用: 取得不可"):"初回: 取得不可";
 
   // ---- 3. v4/v6レイテンシ ----
